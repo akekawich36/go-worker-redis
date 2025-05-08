@@ -1,13 +1,20 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
+	"fmt"
 	"log"
 	"net/http"
 	"time"
 
+	"github.com/go-redis/redis/v8"
+	"github.com/gorilla/websocket"
 	"github.com/labstack/echo/v4"
 	"github.com/streadway/amqp"
+
+	rabbit "go-worker-redis/infrastructure/rabbit"
+	localRedis "go-worker-redis/infrastructure/redis"
 )
 
 type TaskResponse struct {
@@ -21,58 +28,66 @@ type TaskRequest struct {
 	TaskID string `json:"task_id"`
 }
 
+var ctx = context.Background()
+
 var (
-	rabbitConn *amqp.Connection
-	rabbitCh   *amqp.Channel
+	rabbitConn  *amqp.Connection
+	rabbitCh    *amqp.Channel
+	redisClient *redis.Client
+	upgrader    = websocket.Upgrader{
+		CheckOrigin: func(r *http.Request) bool {
+			return true
+		},
+	}
 )
-
-func setupRabbitMQ() error {
-	var err error
-	rabbitConn, err = amqp.Dial("amqp://guest:guest@localhost:5672/")
-	if err != nil {
-		return err
-	}
-
-	rabbitCh, err = rabbitConn.Channel()
-	if err != nil {
-		return err
-	}
-
-	_, err = rabbitCh.QueueDeclare(
-		"taskQueue",
-		false,
-		false,
-		false,
-		false,
-		nil,
-	)
-	if err != nil {
-		return err
-	}
-
-	return nil
-}
 
 func main() {
 	e := echo.New()
 
-	err := setupRabbitMQ()
-	if err != nil {
-		log.Fatalf("Failed to set up RabbitMQ: %s", err)
-	}
-	defer func() {
-		if rabbitCh != nil {
-			rabbitCh.Close()
-		}
-		if rabbitConn != nil {
-			rabbitConn.Close()
-		}
-	}()
+	// RabbitMq Setup
+	rabbitConn, rabbitCh := rabbit.SetupRabbitMQ()
+	defer rabbitConn.Close()
+	defer rabbitCh.Close()
+
+	// Redis Setup
+	redisClient := localRedis.SetupRedis()
+	defer redisClient.Close()
 
 	e.Static("/public", "public")
 
+	e.GET("/ws", handleWebSocket)
 	e.GET("/api/export-xlsx", handleXlsxFile)
+
 	e.Logger.Fatal(e.Start(":8080"))
+}
+
+func handleWebSocket(c echo.Context) error {
+	ws, err := upgrader.Upgrade(c.Response(), c.Request(), nil)
+	if err != nil {
+		return err
+	}
+	defer ws.Close()
+
+	fmt.Println("Connected!")
+
+	for {
+		mt, message, err := ws.ReadMessage()
+		if err != nil {
+			log.Println("read:", err)
+			break
+		}
+		log.Printf("recv: %s", message)
+		err = ws.WriteMessage(mt, message)
+		if err != nil {
+			log.Println("write:", err)
+			break
+		}
+	}
+
+	subscriber := redisClient.Subscribe(ctx, "file_download")
+	defer subscriber.Close()
+
+	return nil
 }
 
 func handleXlsxFile(c echo.Context) error {

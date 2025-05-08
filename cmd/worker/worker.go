@@ -8,7 +8,7 @@ import (
 	"github.com/go-redis/redis/v8"
 	"github.com/streadway/amqp"
 
-	xlsx "go-worker/pkg/xlsx"
+	xlsx "go-worker-redis/pkg/xlsx"
 )
 
 type TaskRequest struct {
