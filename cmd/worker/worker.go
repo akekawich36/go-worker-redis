@@ -1,4 +1,4 @@
-package main
+package worker
 
 import (
 	"encoding/json"
@@ -7,12 +7,11 @@ import (
 
 	"github.com/go-redis/redis/v8"
 	"github.com/streadway/amqp"
-
-	xlsx "go-worker-redis/pkg/xlsx"
 )
 
-type TaskRequest struct {
+type TaskMessage struct {
 	TaskID string `json:"task_id"`
+	Action string `json:"action"`
 }
 
 type TaskResponse struct {
@@ -22,30 +21,11 @@ type TaskResponse struct {
 	ErrorMsg string `json:"error_msg,omitempty"`
 }
 
-func main() {
-	// Connect to RabbitMQ
-	conn, err := amqp.Dial("amqp://guest:guest@localhost:5672/")
-	if err != nil {
-		log.Fatalf("Failed to connect to RabbitMQ: %s", err)
-	}
-	defer conn.Close()
+func StartWorker(rabbitCh *amqp.Channel, redisClient *redis.Client) {
+	fmt.Println("Worker started...")
 
-	ch, err := conn.Channel()
-	if err != nil {
-		log.Fatalf("Failed to open a channel: %s", err)
-	}
-	defer ch.Close()
-
-	// Connect to Redis
-	redisClient := redis.NewClient(&redis.Options{
-		Addr:     "localhost:6379",
-		Password: "", // no password set
-		DB:       0,  // use default DB
-	})
-	defer redisClient.Close()
-
-	// Declare the same queue as in the main.go
-	q, err := ch.QueueDeclare(
+	// Declare the queue to ensure it exists
+	_, err := rabbitCh.QueueDeclare(
 		"file_processing", // queue name
 		false,             // durable
 		false,             // delete when unused
@@ -54,92 +34,159 @@ func main() {
 		nil,               // arguments
 	)
 	if err != nil {
-		log.Fatalf("Failed to declare a queue: %s", err)
+		log.Fatalf("Failed to declare queue: %v", err)
 	}
-
-	fmt.Println(q.Name)
 
 	// Consume messages from the queue
-	msgs, err := ch.Consume(
-		q.Name, // queue
-		"",     // consumer
-		false,  // auto-ack
-		false,  // exclusive
-		false,  // no-local
-		false,  // no-wait
-		nil,    // args
+	msgs, err := rabbitCh.Consume(
+		"file_processing", // queue
+		"",                // consumer
+		false,             // auto-ack (we use manual ack)
+		false,             // exclusive
+		false,             // no-local
+		false,             // no-wait
+		nil,               // args
 	)
 	if err != nil {
-		log.Fatalf("Failed to register a consumer: %s", err)
+		log.Fatalf("Failed to register consumer: %v", err)
 	}
 
-	err = ch.Qos(
-		1,     // prefetch count
-		0,     // prefetch size
-		false, // global
-	)
+	fmt.Println("Worker is running...")
 
-	log.Println("Worker started. Waiting for messages...", msgs)
+	// Process messages
+	go func() {
+		for msg := range msgs {
+			var task TaskMessage
+			err := json.Unmarshal(msg.Body, &task)
+			if err != nil {
+				log.Printf("Failed to parse message: %v\n", err)
+				msg.Nack(false, false) // Reject without requeue
+				continue
+			}
 
-	// Process messages in a goroutine
-	forever := make(chan bool)
-	go processMessages(msgs)
+			switch task.Action {
+			case "generate_xlsx":
+				fmt.Println("generate xlsx was running")
+			default:
+				log.Printf("Unknown action: %s", task.Action)
+				msg.Nack(false, false) // Reject without requeue
+				continue
+			}
 
-	<-forever // Keep the main function running
+			// Acknowledge message
+			msg.Ack(false)
+		}
+	}()
+
+	select {} // Keep worker running
 }
 
-func processMessages(msgs <-chan amqp.Delivery) {
-	for d := range msgs {
-		log.Printf("Received a message: %s", d.Body)
+// func main() {
+// 	// Connect to RabbitMQ
+// 	rabbitConn, rabbitCh := rabbit.SetupRabbitMQ()
+// 	defer rabbitConn.Close()
+// 	defer rabbitCh.Close()
 
-		// Parse the task request
-		var task TaskRequest
-		err := json.Unmarshal(d.Body, &task)
-		if err != nil {
-			log.Printf("Error parsing task: %s", err)
-			d.Nack(false, false) // Negative acknowledgment, don't requeue
-			continue
-		}
+// 	// Redis Setup
+// 	redisClient := localRedis.SetupRedis()
+// 	defer redisClient.Close()
 
-		// Generate the Excel file using your existing function
-		result := xlsx.ProcessXlsx()
+// 	// Declare the same queue as in the main.go
+// 	q, err := rabbitCh.QueueDeclare(
+// 		"file_processing", // queue name
+// 		false,             // durable
+// 		false,             // delete when unused
+// 		false,             // exclusive
+// 		false,             // no-wait
+// 		nil,               // arguments
+// 	)
+// 	if err != nil {
+// 		log.Fatalf("Failed to declare a queue: %s", err)
+// 	}
 
-		// Create the task response
-		response := &TaskResponse{}
+// 	fmt.Println(q.Name)
 
-		// Set response fields based on result
-		if result.Status {
-			response.Status = "completed"
-			response.FileURL = result.FileURL
-		} else {
-			response.Status = "failed"
-			response.ErrorMsg = result.Message
-		}
+// 	// Consume messages from the queue
+// 	msgs, err := rabbitCh.Consume(
+// 		q.Name, // queue
+// 		"",     // consumer
+// 		false,  // auto-ack
+// 		false,  // exclusive
+// 		false,  // no-local
+// 		false,  // no-wait
+// 		nil,    // args
+// 	)
+// 	if err != nil {
+// 		log.Fatalf("Failed to register a consumer: %s", err)
+// 	}
 
-		// Convert response to JSON
-		if err != nil {
-			log.Printf("Error marshaling response: %s", err)
-			d.Nack(false, true) // Negative acknowledgment, requeue
-			continue
-		}
+// 	err = rabbitCh.Qos(
+// 		1,     // prefetch count
+// 		0,     // prefetch size
+// 		false, // global
+// 	)
 
-		// Store the result in Redis
-		// ctx := context.Background()
-		// err = redisClient.Set(ctx, "task:"+task.TaskID, responseJSON, 24*time.Hour).Err()
-		// if err != nil {
-		// 	log.Printf("Error storing result in Redis: %s", err)
-		// 	d.Nack(false, true) // Negative acknowledgment, requeue
-		// 	continue
-		// }
+// 	log.Println("Worker started. Waiting for messages...", msgs)
 
-		// // Publish a notification to Redis pub/sub
-		// err = redisClient.Publish(ctx, "task_updates", responseJSON).Err()
-		// if err != nil {
-		// 	log.Printf("Error publishing notification: %s", err)
-		// 	// Continue anyway, as the task was processed successfully
-		// }
+// 	// Process messages in a goroutine
+// 	forever := make(chan bool)
+// 	go processMessages(msgs)
 
-		log.Printf("Task %s processed successfully", task.TaskID)
-		d.Ack(false) // Acknowledge the message
-	}
-}
+// 	<-forever // Keep the main function running
+// }
+
+// func processMessages(msgs <-chan amqp.Delivery) {
+// 	for d := range msgs {
+// 		log.Printf("Received a message: %s", d.Body)
+
+// 		// Parse the task request
+// 		var task TaskRequest
+// 		err := json.Unmarshal(d.Body, &task)
+// 		if err != nil {
+// 			log.Printf("Error parsing task: %s", err)
+// 			d.Nack(false, false) // Negative acknowledgment, don't requeue
+// 			continue
+// 		}
+
+// 		// Generate the Excel file using your existing function
+// 		result := xlsx.ProcessXlsx()
+
+// 		// Create the task response
+// 		response := &TaskResponse{}
+
+// 		// Set response fields based on result
+// 		if result.Status {
+// 			response.Status = "completed"
+// 			response.FileURL = result.FileURL
+// 		} else {
+// 			response.Status = "failed"
+// 			response.ErrorMsg = result.Message
+// 		}
+
+// 		// Convert response to JSON
+// 		if err != nil {
+// 			log.Printf("Error marshaling response: %s", err)
+// 			d.Nack(false, true) // Negative acknowledgment, requeue
+// 			continue
+// 		}
+
+// 		// Store the result in Redis
+// 		// ctx := context.Background()
+// 		// err = redisClient.Set(ctx, "task:"+task.TaskID, responseJSON, 24*time.Hour).Err()
+// 		// if err != nil {
+// 		// 	log.Printf("Error storing result in Redis: %s", err)
+// 		// 	d.Nack(false, true) // Negative acknowledgment, requeue
+// 		// 	continue
+// 		// }
+
+// 		// // Publish a notification to Redis pub/sub
+// 		// err = redisClient.Publish(ctx, "task_updates", responseJSON).Err()
+// 		// if err != nil {
+// 		// 	log.Printf("Error publishing notification: %s", err)
+// 		// 	// Continue anyway, as the task was processed successfully
+// 		// }
+
+// 		log.Printf("Task %s processed successfully", task.TaskID)
+// 		d.Ack(false) // Acknowledge the message
+// 	}
+// }

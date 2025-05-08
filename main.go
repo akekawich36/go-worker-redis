@@ -4,17 +4,17 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"log"
 	"net/http"
 	"time"
 
 	"github.com/go-redis/redis/v8"
-	"github.com/gorilla/websocket"
 	"github.com/labstack/echo/v4"
 	"github.com/streadway/amqp"
 
+	worker "go-worker-redis/cmd/worker"
 	rabbit "go-worker-redis/infrastructure/rabbit"
 	localRedis "go-worker-redis/infrastructure/redis"
+	ws "go-worker-redis/infrastructure/websocket"
 )
 
 type TaskResponse struct {
@@ -34,11 +34,6 @@ var (
 	rabbitConn  *amqp.Connection
 	rabbitCh    *amqp.Channel
 	redisClient *redis.Client
-	upgrader    = websocket.Upgrader{
-		CheckOrigin: func(r *http.Request) bool {
-			return true
-		},
-	}
 )
 
 func main() {
@@ -53,45 +48,34 @@ func main() {
 	redisClient := localRedis.SetupRedis()
 	defer redisClient.Close()
 
+	go worker.StartWorker(rabbitCh, redisClient)
+
 	e.Static("/public", "public")
 
-	e.GET("/ws", handleWebSocket)
-	e.GET("/api/export-xlsx", handleXlsxFile)
+	e.GET("/ws/:roomId", func(c echo.Context) error {
+		return ws.HandleWebSocket(c, redisClient, ctx)
+	})
+
+	e.GET("/api/export-xlsx", func(c echo.Context) error {
+		return handleXlsxFile(c, rabbitCh)
+	})
 
 	e.Logger.Fatal(e.Start(":8080"))
 }
 
-func handleWebSocket(c echo.Context) error {
-	ws, err := upgrader.Upgrade(c.Response(), c.Request(), nil)
-	if err != nil {
-		return err
-	}
-	defer ws.Close()
-
-	fmt.Println("Connected!")
-
-	for {
-		mt, message, err := ws.ReadMessage()
-		if err != nil {
-			log.Println("read:", err)
-			break
-		}
-		log.Printf("recv: %s", message)
-		err = ws.WriteMessage(mt, message)
-		if err != nil {
-			log.Println("write:", err)
-			break
-		}
+func handleXlsxFile(c echo.Context, rabbitCh *amqp.Channel) error {
+	if rabbitCh == nil {
+		return c.JSON(http.StatusInternalServerError, map[string]string{
+			"message": "Rabbit Channel is not available",
+		})
 	}
 
-	subscriber := redisClient.Subscribe(ctx, "file_download")
-	defer subscriber.Close()
+	taskID := fmt.Sprintf("task_%d", time.Now().UnixNano())
 
-	return nil
-}
-
-func handleXlsxFile(c echo.Context) error {
-	taskMessage := map[string]string{"message": "generate_xlsx"}
+	taskMessage := map[string]string{
+		"task_id": taskID,
+		"action":  "generate_xlsx",
+	}
 	taskBytes, _ := json.Marshal(taskMessage)
 
 	err := rabbitCh.Publish(
@@ -112,6 +96,7 @@ func handleXlsxFile(c echo.Context) error {
 
 	// Return the task ID to the client
 	return c.JSON(http.StatusOK, map[string]interface{}{
+		"taskId":  taskID,
 		"time":    time.Now(),
 		"message": "Export task queued successfully",
 		"status":  "processing",
