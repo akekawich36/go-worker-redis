@@ -48,7 +48,7 @@ func main() {
 	redisClient := localRedis.SetupRedis()
 	defer redisClient.Close()
 
-	go worker.StartWorker(rabbitCh, redisClient)
+	go worker.StartWorker(rabbitCh, redisClient, ctx)
 
 	e.Static("/public", "public")
 

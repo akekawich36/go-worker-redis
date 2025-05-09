@@ -4,17 +4,13 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"path/filepath"
+	"time"
 
 	"github.com/xuri/excelize/v2"
 )
 
-type ResponseData struct {
-	Status  bool   `json:"status"`
-	Message string `json:"message"`
-	FileURL string `json:"file_url,omitempty"`
-}
-
-func ProcessXlsx() ResponseData {
+func ProcessXlsx() (string, error) {
 	f := excelize.NewFile()
 	sheet := "Sheet1"
 
@@ -35,32 +31,27 @@ func ProcessXlsx() ResponseData {
 		f.SetCellValue(sheet, fmt.Sprintf("F%d", row), "This is a note field with some repeated text to increase file size.")
 	}
 
-	filename := "mock_data_5mb.xlsx"
-	filepath := fmt.Sprintf("public/%s", filename)
+	timestamp := time.Now().Format("20060102-150405")
+	filename := fmt.Sprintf("export_%s.xlsx", timestamp)
+	filepath := filepath.Join("public", filename)
 
 	// Ensure the public directory exists
 	if _, err := os.Stat("public"); os.IsNotExist(err) {
 		if err := os.Mkdir("public", 0755); err != nil {
-			log.Println("Failed to create public directory:", err)
-			return ResponseData{false, "Server error", ""}
+			return "", fmt.Errorf("Failed to create public directory:", err)
 		}
 	}
 
 	// Save to file
 	if err := f.SaveAs(filepath); err != nil {
-		log.Println("Error saving file:", err)
-		return ResponseData{false, "Download failed", ""}
+		return "", fmt.Errorf("Failed to create file:", err)
 	}
 
 	apiUrl := "http://localhost:8080/"
 	if apiUrl == "" {
 		log.Println("API_URL is not set")
-		return ResponseData{false, "API_URL not configured", ""}
+		return "", fmt.Errorf("API_URL not config")
 	}
 
-	return ResponseData{
-		Status:  true,
-		Message: "File generated successfully",
-		FileURL: fmt.Sprintf("%spublic/%s", apiUrl, filename), // Construct the file URL
-	}
+	return filename, nil
 }

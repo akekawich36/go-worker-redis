@@ -41,22 +41,53 @@ func HandleWebSocket(c echo.Context, redisClient *redis.Client, ctx context.Cont
 	}
 	defer ws.Close()
 
-	// room := GetRoom(roomId)
+	room := GetRoom(roomId)
 
-	fmt.Println("Connected!")
+	room.mutex.Lock()
+	room.Clients[ws] = true
+	room.mutex.Unlock()
+
+	fmt.Println("WebSocket Connected!")
+
+	defer func() {
+		room.mutex.Lock()
+		delete(room.Clients, ws)
+		room.mutex.Unlock()
+		ws.Close()
+		fmt.Println("WebSocket Disconnected!")
+	}()
+
+	pubsub := redisClient.Subscribe(ctx, "file_download")
+	defer pubsub.Close()
+
+	// Start a goroutine to listen for Redis messages
+	go func() {
+		channel := pubsub.Channel()
+		for msg := range channel {
+			log.Printf("Received Redis message: %s", msg.Payload)
+
+			// Forward message to all clients in the room
+			room.mutex.Lock()
+			for client := range room.Clients {
+				err := client.WriteMessage(websocket.TextMessage, []byte(msg.Payload))
+				if err != nil {
+					log.Printf("error sending message to client: %v", err)
+				}
+			}
+			room.mutex.Unlock()
+		}
+	}()
 
 	for {
 		_, message, err := ws.ReadMessage()
 		if err != nil {
-			log.Println("read:", err)
+			log.Println("read error:", err)
 			break
 		}
-		log.Printf("recv from %s: %s", roomId, message)
+		log.Printf("received from client in room %s: %s", roomId, message)
+
+		// You can handle client messages here if needed
 	}
-
-	subscriber := redisClient.Subscribe(ctx, "file_download")
-	defer subscriber.Close()
-
 	return nil
 }
 
@@ -79,5 +110,6 @@ func GetRoom(roomID string) *Room {
 
 	rooms[roomID] = room
 
+	fmt.Printf("Created new room: %s\n", roomID)
 	return room
 }
